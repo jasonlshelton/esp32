@@ -2,101 +2,79 @@
 #include <ESPAsyncWebServer.h>
 #include <FastLED.h>
 
-#define LED_PIN     16
-#define NUM_LEDS    60
-#define BRIGHTNESS  80
+#include "matrix.h"
+#include "eyes.h"
+#include "web_ui.h"
 
-CRGB leds[NUM_LEDS];
+#define LED_PIN        16
+#define BRIGHTNESS     10
+#define FRAME_MS       16          // ~60 fps
+#define PSU_VOLTS      5
+#define PSU_MILLIAMPS  2000        // 128 pixels at full white would pull ~7.7 A
+
+CRGB leds[NUM_LEDS + 1];
 AsyncWebServer server(80);
 
-// current state
-uint8_t currentR = 255, currentG = 0, currentB = 0;
-uint8_t currentBrightness = BRIGHTNESS;
-String currentMode = "solid";
+enum Mode : uint8_t { MODE_EYES = 0, MODE_RAINBOW, MODE_OFF, MODE_TEST };
 
-const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <title>Visor Control</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body { font-family: sans-serif; background:#111; color:#eee; text-align:center; padding:20px; }
-    input[type=color] { width:100px; height:60px; border:none; }
-    input[type=range] { width:80%; max-width:320px; accent-color:#e33; }
-    label { font-size:14px; color:#aaa; }
-    button { padding:12px 20px; margin:6px; font-size:16px; border-radius:8px; border:none; background:#333; color:#eee; }
-    button.active { background:#e33; }
-  </style>
-</head>
-<body>
-  <h2>Murder Drones Visor</h2>
-  <input type="color" id="colorPicker" value="#ff0000">
-  <br><br>
-  <label for="brightness">Brightness <span id="brightVal">80</span></label><br>
-  <input type="range" id="brightness" min="1" max="255" value="80">
-  <br><br>
-  <button onclick="setMode('solid')">Solid</button>
-  <button onclick="setMode('pulse')">Pulse</button>
-  <button onclick="setMode('rainbow')">Rainbow</button>
-  <button onclick="setMode('off')">Off</button>
+// Shared with the AsyncTCP task, which runs the HTTP handlers on another core.
+// Everything here is a naturally-aligned scalar so reads and writes are atomic;
+// colour is packed into one word so a half-applied RGB can never be rendered.
+static volatile uint32_t   g_color      = 0xFF00FF;   // Uzi purple
+static volatile uint8_t    g_brightness = BRIGHTNESS;
+static volatile Mode       g_mode       = MODE_EYES;
+static volatile Expression g_expression = EXP_NEUTRAL;
+static volatile bool       g_pulse      = false;
+static volatile bool       g_idle       = true;
 
-  <script>
-    const picker = document.getElementById('colorPicker');
-    picker.addEventListener('input', () => {
-      const hex = picker.value.substring(1);
-      const r = parseInt(hex.substring(0,2), 16);
-      const g = parseInt(hex.substring(2,4), 16);
-      const b = parseInt(hex.substring(4,6), 16);
-      fetch(`/setcolor?r=${r}&g=${g}&b=${b}`);
-    });
-
-    function setMode(mode) {
-      fetch(`/setmode?mode=${mode}`);
-    }
-
-    // Dragging the slider fires 'input' far faster than the ESP32 can service
-    // requests, so coalesce: one in flight at a time, always send the last value.
-    const bright = document.getElementById('brightness');
-    const brightVal = document.getElementById('brightVal');
-    let pending = null, inflight = false;
-
-    function sendBrightness(v) {
-      if (inflight) { pending = v; return; }
-      inflight = true;
-      fetch(`/setbrightness?v=${v}`).finally(() => {
-        inflight = false;
-        if (pending !== null) { const next = pending; pending = null; sendBrightness(next); }
-      });
-    }
-
-    bright.addEventListener('input', () => {
-      brightVal.textContent = bright.value;
-      sendBrightness(bright.value);
-    });
-  </script>
-</body>
-</html>
-)rawliteral";
-
-void applyLEDs() {
-  FastLED.setBrightness(currentBrightness);
-  if (currentMode == "solid") {
-    fill_solid(leds, NUM_LEDS, CRGB(currentR, currentG, currentB));
-    FastLED.show();
-  } else if (currentMode == "off") {
-    fill_solid(leds, NUM_LEDS, CRGB::Black);
-    FastLED.show();
+static const char *modeName(Mode m) {
+  switch (m) {
+    case MODE_RAINBOW: return "rainbow";
+    case MODE_OFF:     return "off";
+    case MODE_TEST:    return "test";
+    default:           return "eyes";
   }
-  // pulse/rainbow handled in loop() since they're animated
+}
+
+static bool modeFromName(const String &s, Mode &out) {
+  if (s == "eyes")    { out = MODE_EYES;    return true; }
+  if (s == "rainbow") { out = MODE_RAINBOW; return true; }
+  if (s == "off")     { out = MODE_OFF;     return true; }
+  if (s == "test")    { out = MODE_TEST;    return true; }
+  return false;
+}
+
+static void drawRainbow(uint32_t now) {
+  uint8_t hue = now / 20;
+  for (int y = 0; y < MATRIX_HEIGHT; y++) {
+    for (int x = 0; x < MATRIX_WIDTH; x++) {
+      setPixel(x, y, CHSV(hue + x * 8 + y * 4, 255, 255));
+    }
+  }
+}
+
+// Wiring calibration. White = origin (0,0). Red ramp brightens along +X, blue
+// ramp brightens along +Y, green dot walks the raw chain order. If any of
+// those look wrong, adjust the #defines at the top of matrix.h.
+static void drawTest(uint32_t now) {
+  clearMatrix();
+  for (int x = 0; x < MATRIX_WIDTH; x++) {
+    setPixel(x, 0, CRGB(map(x, 0, MATRIX_WIDTH - 1, 30, 255), 0, 0));
+  }
+  for (int y = 0; y < MATRIX_HEIGHT; y++) {
+    setPixel(0, y, CRGB(0, 0, map(y, 0, MATRIX_HEIGHT - 1, 30, 255)));
+  }
+  setPixel(0, 0, CRGB::White);
+  leds[(now / 60) % NUM_LEDS] = CRGB::Green;
 }
 
 void setup() {
   Serial.begin(115200);
 
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.setMaxPowerInVoltsAndMilliamps(PSU_VOLTS, PSU_MILLIAMPS);
   FastLED.setBrightness(BRIGHTNESS);
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  clearMatrix();
   FastLED.show();
 
   WiFiManager wm;
@@ -112,34 +90,67 @@ void setup() {
   Serial.println("Connected!");
   Serial.println(WiFi.localIP());
 
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+  resetEyeAnimation(millis());
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/html", index_html);
   });
 
-  server.on("/setcolor", HTTP_GET, [](AsyncWebServerRequest *request){
+  server.on("/state", HTTP_GET, [](AsyncWebServerRequest *request) {
+    char hex[7];
+    snprintf(hex, sizeof(hex), "%06lx", (unsigned long)(g_color & 0xFFFFFF));
+    String json = "{";
+    json += "\"mode\":\"";       json += modeName(g_mode);                 json += "\",";
+    json += "\"expression\":\""; json += expressionName(g_expression);     json += "\",";
+    json += "\"color\":\"";      json += hex;                              json += "\",";
+    json += "\"brightness\":";   json += g_brightness;                     json += ",";
+    json += "\"pulse\":";        json += g_pulse ? "true" : "false";       json += ",";
+    json += "\"idle\":";         json += g_idle ? "true" : "false";
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  server.on("/setcolor", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (request->hasParam("r") && request->hasParam("g") && request->hasParam("b")) {
-      currentR = request->getParam("r")->value().toInt();
-      currentG = request->getParam("g")->value().toInt();
-      currentB = request->getParam("b")->value().toInt();
-      currentMode = "solid";
-      applyLEDs();
+      uint32_t r = constrain(request->getParam("r")->value().toInt(), 0, 255);
+      uint32_t g = constrain(request->getParam("g")->value().toInt(), 0, 255);
+      uint32_t b = constrain(request->getParam("b")->value().toInt(), 0, 255);
+      g_color = (r << 16) | (g << 8) | b;
     }
     request->send(200, "text/plain", "OK");
   });
 
-  server.on("/setbrightness", HTTP_GET, [](AsyncWebServerRequest *request){
+  server.on("/setbrightness", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (request->hasParam("v")) {
-      currentBrightness = constrain(request->getParam("v")->value().toInt(), 0, 255);
-      applyLEDs();
+      g_brightness = constrain(request->getParam("v")->value().toInt(), 0, 255);
     }
     request->send(200, "text/plain", "OK");
   });
 
-  server.on("/setmode", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (request->hasParam("mode")) {
-      currentMode = request->getParam("mode")->value();
-      applyLEDs();
+  server.on("/setmode", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Mode m;
+    if (request->hasParam("mode") && modeFromName(request->getParam("mode")->value(), m)) {
+      g_mode = m;
+      request->send(200, "text/plain", "OK");
+    } else {
+      request->send(400, "text/plain", "bad mode");
     }
+  });
+
+  server.on("/setexpression", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Expression e;
+    if (request->hasParam("e") && expressionFromName(request->getParam("e")->value(), e)) {
+      g_expression = e;
+      g_mode = MODE_EYES;
+      request->send(200, "text/plain", "OK");
+    } else {
+      request->send(400, "text/plain", "bad expression");
+    }
+  });
+
+  server.on("/settoggle", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("pulse")) g_pulse = request->getParam("pulse")->value().toInt() != 0;
+    if (request->hasParam("idle"))  g_idle  = request->getParam("idle")->value().toInt() != 0;
     request->send(200, "text/plain", "OK");
   });
 
@@ -147,21 +158,37 @@ void setup() {
 }
 
 void loop() {
-  if (currentMode == "pulse") {
-    static uint8_t brightness = 0;
-    static int8_t direction = 5;
-    brightness += direction;
-    if (brightness == 0 || brightness == 255) direction = -direction;
-    fill_solid(leds, NUM_LEDS, CRGB(currentR, currentG, currentB));
-    FastLED.setBrightness(brightness);
-    FastLED.show();
-    delay(20);
-  } else if (currentMode == "rainbow") {
-    static uint8_t hue = 0;
-    fill_rainbow(leds, NUM_LEDS, hue, 7);
-    FastLED.setBrightness(currentBrightness);
-    FastLED.show();
-    hue++;
-    delay(20);
+  static uint32_t lastFrame = 0;
+  static Expression lastExpression = EXP_NEUTRAL;
+
+  uint32_t now = millis();
+  if (now - lastFrame < FRAME_MS) {
+    delay(1);  // yield to the WiFi/AsyncTCP tasks instead of spinning
+    return;
   }
+  lastFrame = now;
+
+  const uint32_t rgb = g_color;
+  const CRGB color((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+  const Mode mode = g_mode;
+  const Expression expression = g_expression;
+
+  if (expression != lastExpression) {
+    lastExpression = expression;
+    resetEyeAnimation(now);
+  }
+
+  uint8_t bright = g_brightness;
+  if (g_pulse && mode == MODE_EYES) bright = scale8(bright, beatsin8(24, 70, 255));
+  FastLED.setBrightness(bright);
+
+  switch (mode) {
+    case MODE_EYES:    drawEyes(expression, color, now, g_idle); break;
+    case MODE_RAINBOW: drawRainbow(now);                         break;
+    case MODE_TEST:    drawTest(now);                            break;
+    case MODE_OFF:
+    default:           clearMatrix();                            break;
+  }
+
+  FastLED.show();
 }
