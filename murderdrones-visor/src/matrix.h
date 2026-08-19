@@ -12,7 +12,7 @@
 // draws a white pixel at (0,0), a red ramp along +X, a blue ramp along +Y, and
 // a green dot walking the raw chain order.
 #define MATRIX_SERPENTINE       1  // 1 = alternate lines run backwards
-#define MATRIX_VERTICAL_STRIPS  0  // 1 = chain runs in columns of 8, not rows of 16
+#define MATRIX_VERTICAL_STRIPS  1  // 1 = chain runs in columns of 8, not rows of 16
 #define MATRIX_FLIP_X           0
 #define MATRIX_FLIP_Y           0
 
